@@ -1,4 +1,4 @@
-import type { types as t, Visitor } from '@babel/core'
+import type * as babelCore from '@babel/core'
 
 /**
  * Replace this:
@@ -9,16 +9,14 @@ import type { types as t, Visitor } from '@babel/core'
  *
  *     var _jsx = require("react/jsx-runtime").jsx
  */
-export function babelImportToRequire({
-  types: t
-}: typeof import('@babel/core')): {
-  visitor: Visitor
+export function babelImportToRequire({ types: t }: typeof babelCore): {
+  visitor: babelCore.Visitor
 } {
   return {
     visitor: {
       ImportDeclaration(path) {
         const decl = path.node
-        const spec = decl.specifiers[0] as t.ImportSpecifier
+        const spec = decl.specifiers[0] as babelCore.types.ImportSpecifier
 
         path.replaceWith(
           t.variableDeclaration('var', [

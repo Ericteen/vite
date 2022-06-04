@@ -1,8 +1,9 @@
+import path from 'path'
 import type { ParserOptions, TransformOptions, types as t } from '@babel/core'
 import * as babel from '@babel/core'
 import { createFilter } from '@rollup/pluginutils'
-import resolve from 'resolve'
-import type { Plugin, PluginOption } from 'vite'
+import { normalizePath } from 'vite'
+import type { Plugin, PluginOption, ResolvedConfig } from 'vite'
 import {
   addRefreshWrapper,
   isRefreshBoundary,
@@ -32,33 +33,87 @@ export interface Options {
    * @default "react"
    */
   jsxImportSource?: string
-
+  /**
+   * Set this to `true` to annotate the JSX factory with `\/* @__PURE__ *\/`.
+   * This option is ignored when `jsxRuntime` is not `"automatic"`.
+   * @default true
+   */
+  jsxPure?: boolean
   /**
    * Babel configuration applied in both dev and prod.
    */
-  babel?: TransformOptions
-  /**
-   * @deprecated Use `babel.parserOpts.plugins` instead
-   */
-  parserPlugins?: ParserOptions['plugins']
+  babel?:
+    | BabelOptions
+    | ((id: string, options: { ssr?: boolean }) => BabelOptions)
+}
+
+export type BabelOptions = Omit<
+  TransformOptions,
+  | 'ast'
+  | 'filename'
+  | 'root'
+  | 'sourceFileName'
+  | 'sourceMaps'
+  | 'inputSourceMap'
+>
+
+/**
+ * The object type used by the `options` passed to plugins with
+ * an `api.reactBabel` method.
+ */
+export interface ReactBabelOptions extends BabelOptions {
+  plugins: Extract<BabelOptions['plugins'], any[]>
+  presets: Extract<BabelOptions['presets'], any[]>
+  overrides: Extract<BabelOptions['overrides'], any[]>
+  parserOpts: ParserOptions & {
+    plugins: Extract<ParserOptions['plugins'], any[]>
+  }
+}
+
+type ReactBabelHook = (
+  babelConfig: ReactBabelOptions,
+  context: ReactBabelHookContext,
+  config: ResolvedConfig
+) => void
+
+type ReactBabelHookContext = { ssr: boolean; id: string }
+
+declare module 'vite' {
+  export interface Plugin {
+    api?: {
+      /**
+       * Manipulate the Babel options of `@vitejs/plugin-react`
+       */
+      reactBabel?: ReactBabelHook
+    }
+  }
 }
 
 export default function viteReact(opts: Options = {}): PluginOption[] {
   // Provide default values for Rollup compat.
   let base = '/'
+  let resolvedCacheDir: string
   let filter = createFilter(opts.include, opts.exclude)
   let isProduction = true
   let projectRoot = process.cwd()
   let skipFastRefresh = opts.fastRefresh === false
   let skipReactImport = false
+  let runPluginOverrides = (
+    options: ReactBabelOptions,
+    context: ReactBabelHookContext
+  ) => false
+  let staticBabelOptions: ReactBabelOptions | undefined
 
   const useAutomaticRuntime = opts.jsxRuntime !== 'classic'
 
-  const userPlugins = opts.babel?.plugins || []
-  const userParserPlugins =
-    opts.parserPlugins || opts.babel?.parserOpts?.plugins || []
+  // Support patterns like:
+  // - import * as React from 'react';
+  // - import React from 'react';
+  // - import React, {useEffect} from 'react';
+  const importReactRE = /(^|\n)import\s+(\*\s+as\s+)?React(,|\s+)/
 
-  const importReactRE = /(^|\n)import\s+(\*\s+as\s+)?React\s+/
+  // Any extension, including compound ones like '.bs.js'
+  const fileExtensionRE = /\.[^\/\s\?]+$/
 
   const viteBabel: Plugin = {
     name: 'vite:react-babel',
@@ -66,11 +121,12 @@ export default function viteReact(opts: Options = {}): PluginOption[] {
     configResolved(config) {
       base = config.base
       projectRoot = config.root
+      resolvedCacheDir = normalizePath(path.resolve(config.cacheDir))
       filter = createFilter(opts.include, opts.exclude, {
         resolve: projectRoot
       })
       isProduction = config.isProduction
-      skipFastRefresh = isProduction || config.command === 'build'
+      skipFastRefresh ||= isProduction || config.command === 'build'
 
       const jsxInject = config.esbuild && config.esbuild.jsxInject
       if (jsxInject && importReactRE.test(jsxInject)) {
@@ -81,64 +137,91 @@ export default function viteReact(opts: Options = {}): PluginOption[] {
         )
       }
 
-      config.plugins.forEach(
-        (plugin) =>
-          (plugin.name === 'react-refresh' ||
-            (plugin !== viteReactJsx && plugin.name === 'vite:react-jsx')) &&
-          config.logger.warn(
+      config.plugins.forEach((plugin) => {
+        const hasConflict =
+          plugin.name === 'react-refresh' ||
+          (plugin !== viteReactJsx && plugin.name === 'vite:react-jsx')
+
+        if (hasConflict)
+          return config.logger.warn(
             `[@vitejs/plugin-react] You should stop using "${plugin.name}" ` +
               `since this plugin conflicts with it.`
           )
-      )
+      })
+
+      runPluginOverrides = (babelOptions, context) => {
+        const hooks = config.plugins
+          .map((plugin) => plugin.api?.reactBabel)
+          .filter(Boolean) as ReactBabelHook[]
+
+        if (hooks.length > 0) {
+          return (runPluginOverrides = (babelOptions) => {
+            hooks.forEach((hook) => hook(babelOptions, context, config))
+            return true
+          })(babelOptions)
+        }
+        runPluginOverrides = () => false
+        return false
+      }
     },
-    async transform(code, id, ssr) {
-      if (/\.[tj]sx?$/.test(id)) {
-        const plugins = [...userPlugins]
+    async transform(code, id, options) {
+      const ssr = typeof options === 'boolean' ? options : options?.ssr === true
+      // File extension could be mocked/overridden in querystring.
+      const [filepath, querystring = ''] = id.split('?')
+      const [extension = ''] =
+        querystring.match(fileExtensionRE) ||
+        filepath.match(fileExtensionRE) ||
+        []
 
-        const parserPlugins: typeof userParserPlugins = [
-          ...userParserPlugins,
-          'jsx',
-          'importMeta',
-          // This plugin is applied before esbuild transforms the code,
-          // so we need to enable some stage 3 syntax that is supported in
-          // TypeScript and some environments already.
-          'topLevelAwait',
-          'classProperties',
-          'classPrivateProperties',
-          'classPrivateMethods'
-        ]
+      if (/\.(mjs|[tj]sx?)$/.test(extension)) {
+        const isJSX = extension.endsWith('x')
+        const isNodeModules = id.includes('/node_modules/')
+        const isProjectFile =
+          !isNodeModules && (id[0] === '\0' || id.startsWith(projectRoot + '/'))
 
-        const isTypeScript = /\.tsx?$/.test(id)
-        if (isTypeScript) {
-          parserPlugins.push('typescript')
+        let babelOptions = staticBabelOptions
+        if (typeof opts.babel === 'function') {
+          const rawOptions = opts.babel(id, { ssr })
+          babelOptions = createBabelOptions(rawOptions)
+          runPluginOverrides(babelOptions, { ssr, id: id })
+        } else if (!babelOptions) {
+          babelOptions = createBabelOptions(opts.babel)
+          if (!runPluginOverrides(babelOptions, { ssr, id: id })) {
+            staticBabelOptions = babelOptions
+          }
         }
 
-        const isNodeModules = id.includes('node_modules')
+        const plugins = isProjectFile ? [...babelOptions.plugins] : []
 
         let useFastRefresh = false
         if (!skipFastRefresh && !ssr && !isNodeModules) {
           // Modules with .js or .ts extension must import React.
-          const isReactModule = id.endsWith('x') || code.includes('react')
+          const isReactModule = isJSX || importReactRE.test(code)
           if (isReactModule && filter(id)) {
             useFastRefresh = true
             plugins.push([
-              await loadPlugin('react-refresh/babel.js'),
+              await loadPlugin('react-refresh/babel'),
               { skipEnvCheck: true }
             ])
           }
         }
 
         let ast: t.File | null | undefined
-        if (isNodeModules || id.endsWith('x')) {
+        if (!isProjectFile || isJSX) {
           if (useAutomaticRuntime) {
             // By reverse-compiling "React.createElement" calls into JSX,
             // React elements provided by dependencies will also use the
             // automatic runtime!
-            const [restoredAst, isCommonJS] = isNodeModules
-              ? await restoreJSX(babel, code, id)
-              : [null, false]
+            // Avoid parsing the optimized react-dom since it will never
+            // contain compiled JSX and it's a pretty big file (800kb).
+            const isOptimizedReactDom =
+              id.startsWith(resolvedCacheDir) && id.includes('/react-dom.js')
+            const [restoredAst, isCommonJS] =
+              !isProjectFile && !isJSX && !isOptimizedReactDom
+                ? await restoreJSX(babel, code, id)
+                : [null, false]
 
-            if (!isNodeModules || (ast = restoredAst)) {
+            if (isJSX || (ast = restoredAst)) {
               plugins.push([
                 await loadPlugin(
                   '@babel/plugin-transform-react-jsx' +
@@ -146,7 +229,8 @@ export default function viteReact(opts: Options = {}): PluginOption[] {
                 ),
                 {
                   runtime: 'automatic',
-                  importSource: opts.jsxImportSource
+                  importSource: opts.jsxImportSource,
+                  pure: opts.jsxPure !== false
                 }
               ])
 
@@ -155,7 +239,7 @@ export default function viteReact(opts: Options = {}): PluginOption[] {
                 plugins.push(babelImportToRequire)
               }
             }
-          } else if (!isNodeModules) {
+          } else if (isProjectFile) {
             // These plugins are only needed for the classic runtime.
             if (!isProduction) {
               plugins.push(
@@ -172,34 +256,65 @@ export default function viteReact(opts: Options = {}): PluginOption[] {
           }
         }
 
-        const isReasonReact = id.endsWith('.bs.js')
+        // Plugins defined through this Vite plugin are only applied
+        // to modules within the project root, but "babel.config.js"
+        // files can define plugins that need to be applied to every
+        // module, including node_modules and linked packages.
+        const shouldSkip =
+          !plugins.length &&
+          !babelOptions.configFile &&
+          !(isProjectFile && babelOptions.babelrc)
 
-        const babelOpts: TransformOptions = {
-          babelrc: false,
-          configFile: false,
-          ...opts.babel,
+        if (shouldSkip) {
+          return // Avoid parsing if no plugins exist.
+        }
+
+        const parserPlugins: typeof babelOptions.parserOpts.plugins = [
+          ...babelOptions.parserOpts.plugins,
+          'importMeta',
+          // This plugin is applied before esbuild transforms the code,
+          // so we need to enable some stage 3 syntax that is supported in
+          // TypeScript and some environments already.
+          'topLevelAwait',
+          'classProperties',
+          'classPrivateProperties',
+          'classPrivateMethods'
+        ]
+
+        if (!extension.endsWith('.ts')) {
+          parserPlugins.push('jsx')
+        }
+
+        if (/\.tsx?$/.test(extension)) {
+          parserPlugins.push('typescript')
+        }
+
+        const transformAsync = ast
+          ? babel.transformFromAstAsync.bind(babel, ast, code)
+          : babel.transformAsync.bind(babel, code)
+
+        const isReasonReact = extension.endsWith('.bs.js')
+        const result = await transformAsync({
+          ...babelOptions,
           ast: !isReasonReact,
           root: projectRoot,
           filename: id,
+          sourceFileName: filepath,
           parserOpts: {
-            ...opts.babel?.parserOpts,
+            ...babelOptions.parserOpts,
             sourceType: 'module',
             allowAwaitOutsideFunction: true,
             plugins: parserPlugins
           },
           generatorOpts: {
-            ...opts.babel?.generatorOpts,
+            ...babelOptions.generatorOpts,
             decoratorsBeforeExport: true
           },
           plugins,
           sourceMaps: true,
           // Vite handles sourcemap flattening
           inputSourceMap: false as any
-        }
-
-        const result = ast
-          ? await babel.transformFromAstAsync(ast, code, babelOpts)
-          : await babel.transformAsync(code, babelOpts)
+        })
 
         if (result) {
           let code = result.code!
@@ -246,7 +361,7 @@ export default function viteReact(opts: Options = {}): PluginOption[] {
     }
   }
 
-  const runtimeId = 'react/jsx-runtime'
+  // const runtimeId = 'react/jsx-runtime'
   // Adapted from https://github.com/alloc/vite-react-jsx
   const viteReactJsx: Plugin = {
     name: 'vite:react-jsx',
@@ -257,10 +372,14 @@ export default function viteReact(opts: Options = {}): PluginOption[] {
           include: ['react/jsx-dev-runtime']
         }
       }
-    },
+    }
+    // TODO: this optimization may not be necesary and it is breacking esbuild+rollup compat,
+    // see https://github.com/vitejs/vite/pull/7246#discussion_r861552185
+    // We could still do the same trick and resolve to the optimized dependency here
+    /*
     resolveId(id: string) {
       return id === runtimeId ? id : null
-    },
+    }, 
     load(id: string) {
       if (id === runtimeId) {
         const runtimePath = resolve.sync(runtimeId, {
@@ -275,7 +394,7 @@ export default function viteReact(opts: Options = {}): PluginOption[] {
           ...exports.map((name) => `export const ${name} = jsxRuntime.${name}`)
         ].join('\n')
       }
-    }
+    } */
   }
 
   return [viteBabel, viteReactRefresh, useAutomaticRuntime && viteReactJsx]
@@ -287,6 +406,18 @@ function loadPlugin(path: string): Promise<any> {
   return import(path).then((module) => module.default || module)
 }
 
-// overwrite for cjs require('...')() usage
-module.exports = viteReact
-viteReact['default'] = viteReact
+function createBabelOptions(rawOptions?: BabelOptions) {
+  const babelOptions = {
+    babelrc: false,
+    configFile: false,
+    ...rawOptions
+  } as ReactBabelOptions
+
+  babelOptions.plugins ||= []
+  babelOptions.presets ||= []
+  babelOptions.overrides ||= []
+  babelOptions.parserOpts ||= {} as any
+  babelOptions.parserOpts.plugins ||= []
+
+  return babelOptions
+}

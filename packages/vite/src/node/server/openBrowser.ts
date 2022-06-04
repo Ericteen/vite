@@ -8,12 +8,13 @@
  *
  */
 
-import path from 'path'
-import open from 'open'
-import execa from 'execa'
-import chalk from 'chalk'
+import { join } from 'path'
 import { execSync } from 'child_process'
-import { Logger } from '../logger'
+import open from 'open'
+import spawn from 'cross-spawn'
+import colors from 'picocolors'
+import type { Logger } from '../logger'
+import { VITE_PACKAGE_DIR } from '../constants'
 
 // https://github.com/sindresorhus/open#app
 const OSX_CHROME = 'google chrome'
@@ -40,14 +41,14 @@ export function openBrowser(
 
 function executeNodeScript(scriptPath: string, url: string, logger: Logger) {
   const extraArgs = process.argv.slice(2)
-  const child = execa('node', [scriptPath, ...extraArgs, url], {
+  const child = spawn(process.execPath, [scriptPath, ...extraArgs, url], {
     stdio: 'inherit'
   })
   child.on('close', (code) => {
     if (code !== 0) {
       logger.error(
-        chalk.red(
-          `\nThe script specified as BROWSER environment variable failed.\n\n${chalk.cyan(
+        colors.red(
+          `\nThe script specified as BROWSER environment variable failed.\n\n${colors.cyan(
             scriptPath
           )} exited with code ${code}.`
         ),
@@ -72,7 +73,7 @@ function startBrowserProcess(browser: string | undefined, url: string) {
       // on OS X Google Chrome with AppleScript
       execSync('ps cax | grep "Google Chrome"')
       execSync('osascript openChrome.applescript "' + encodeURI(url) + '"', {
-        cwd: path.dirname(require.resolve('vite/bin/openChrome.applescript')),
+        cwd: join(VITE_PACKAGE_DIR, 'bin'),
         stdio: 'ignore'
       })
       return true

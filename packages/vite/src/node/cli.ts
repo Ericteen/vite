@@ -1,10 +1,12 @@
+import { performance } from 'perf_hooks'
 import { cac } from 'cac'
-import chalk from 'chalk'
-import { BuildOptions } from './build'
-import { ServerOptions } from './server'
-import { createLogger, LogLevel } from './logger'
+import colors from 'picocolors'
+import type { BuildOptions } from './build'
+import type { ServerOptions } from './server'
+import type { LogLevel } from './logger'
+import { createLogger } from './logger'
+import { VERSION } from './constants'
 import { resolveConfig } from '.'
-import { preview } from './preview'
 
 const cli = cac('vite')
 
@@ -13,8 +15,6 @@ interface GlobalCLIOptions {
   '--'?: string[]
   c?: boolean | string
   config?: string
-  r?: string
-  root?: string
   base?: string
   l?: LogLevel
   logLevel?: LogLevel
@@ -25,6 +25,7 @@ interface GlobalCLIOptions {
   filter?: string
   m?: string
   mode?: string
+  force?: boolean
 }
 
 /**
@@ -37,8 +38,6 @@ function cleanOptions<Options extends GlobalCLIOptions>(
   delete ret['--']
   delete ret.c
   delete ret.config
-  delete ret.r
-  delete ret.root
   delete ret.base
   delete ret.l
   delete ret.logLevel
@@ -54,7 +53,6 @@ function cleanOptions<Options extends GlobalCLIOptions>(
 
 cli
   .option('-c, --config <file>', `[string] use specified config file`)
-  .option('-r, --root <path>', `[string] use specified root directory`)
   .option('--base <path>', `[string] public base path (default: /)`)
   .option('-l, --logLevel <level>', `[string] info | warn | error | silent`)
   .option('--clearScreen', `[boolean] allow/disable clear screen when logging`)
@@ -64,8 +62,9 @@ cli
 
 // dev
 cli
-  .command('[root]') // default command
-  .alias('serve')
+  .command('[root]', 'start dev server') // default command
+  .alias('serve') // the command is called 'serve' in Vite's API
+  .alias('dev') // alias to align with the script name
   .option('--host [host]', `[string] specify hostname`)
   .option('--port <port>', `[number] specify port`)
   .option('--https', `[boolean] use TLS + HTTP/2`)
@@ -90,10 +89,36 @@ cli
         clearScreen: options.clearScreen,
         server: cleanOptions(options)
       })
+
+      if (!server.httpServer) {
+        throw new Error('HTTP server not available')
+      }
+
       await server.listen()
+
+      const info = server.config.logger.info
+
+      // @ts-ignore
+      const viteStartTime = global.__vite_start_time ?? false
+      const startupDurationString = viteStartTime
+        ? colors.dim(
+            `ready in ${colors.white(
+              colors.bold(Math.ceil(performance.now() - viteStartTime))
+            )} ms`
+          )
+        : ''
+
+      info(
+        `\n  ${colors.green(
+          `${colors.bold('VITE')} v${VERSION}`
+        )}  ${startupDurationString}\n`,
+        { clear: !server.config.logger.hasWarned }
+      )
+
+      server.printUrls()
     } catch (e) {
       createLogger(options.logLevel).error(
-        chalk.red(`error when starting dev server:\n${e.stack}`),
+        colors.red(`error when starting dev server:\n${e.stack}`),
         { error: e }
       )
       process.exit(1)
@@ -102,12 +127,12 @@ cli
 
 // build
 cli
-  .command('build [root]')
+  .command('build [root]', 'build for production')
   .option('--target <target>', `[string] transpile target (default: 'modules')`)
   .option('--outDir <dir>', `[string] output directory (default: dist)`)
   .option(
     '--assetsDir <dir>',
-    `[string] directory under outDir to place assets in (default: _assets)`
+    `[string] directory under outDir to place assets in (default: assets)`
   )
   .option(
     '--assetsInlineLimit <number>',
@@ -124,10 +149,14 @@ cli
   .option(
     '--minify [minifier]',
     `[boolean | "terser" | "esbuild"] enable/disable minification, ` +
-      `or specify minifier to use (default: terser)`
+      `or specify minifier to use (default: esbuild)`
   )
-  .option('--manifest', `[boolean] emit build manifest json`)
-  .option('--ssrManifest', `[boolean] emit ssr manifest json`)
+  .option('--manifest [name]', `[boolean | string] emit build manifest json`)
+  .option('--ssrManifest [name]', `[boolean | string] emit ssr manifest json`)
+  .option(
+    '--force',
+    `[boolean] force the optimizer to ignore the cache and re-bundle (experimental)`
+  )
   .option(
     '--emptyOutDir',
     `[boolean] force empty outDir when it's outside of root`
@@ -145,11 +174,12 @@ cli
         configFile: options.config,
         logLevel: options.logLevel,
         clearScreen: options.clearScreen,
+        force: options.force,
         build: buildOptions
       })
     } catch (e) {
       createLogger(options.logLevel).error(
-        chalk.red(`error during build:\n${e.stack}`),
+        colors.red(`error during build:\n${e.stack}`),
         { error: e }
       )
       process.exit(1)
@@ -158,7 +188,7 @@ cli
 
 // optimize
 cli
-  .command('optimize [root]')
+  .command('optimize [root]', 'pre-bundle dependencies')
   .option(
     '--force',
     `[boolean] force the optimizer to ignore the cache and re-bundle`
@@ -180,7 +210,7 @@ cli
         await optimizeDeps(config, options.force, true)
       } catch (e) {
         createLogger(options.logLevel).error(
-          chalk.red(`error when optimizing deps:\n${e.stack}`),
+          colors.red(`error when optimizing deps:\n${e.stack}`),
           { error: e }
         )
         process.exit(1)
@@ -189,12 +219,12 @@ cli
   )
 
 cli
-  .command('preview [root]')
+  .command('preview [root]', 'locally preview production build')
   .option('--host [host]', `[string] specify hostname`)
   .option('--port <port>', `[number] specify port`)
+  .option('--strictPort', `[boolean] exit if specified port is already in use`)
   .option('--https', `[boolean] use TLS + HTTP/2`)
   .option('--open [path]', `[boolean | string] open browser on startup`)
-  .option('--strictPort', `[boolean] exit if specified port is already in use`)
   .action(
     async (
       root: string,
@@ -206,26 +236,26 @@ cli
         strictPort?: boolean
       } & GlobalCLIOptions
     ) => {
+      const { preview } = await import('./preview')
       try {
-        const config = await resolveConfig(
-          {
-            root,
-            base: options.base,
-            configFile: options.config,
-            logLevel: options.logLevel,
-            server: {
-              open: options.open,
-              strictPort: options.strictPort,
-              https: options.https
-            }
-          },
-          'serve',
-          'production'
-        )
-        await preview(config, cleanOptions(options))
+        const server = await preview({
+          root,
+          base: options.base,
+          configFile: options.config,
+          logLevel: options.logLevel,
+          mode: options.mode,
+          preview: {
+            port: options.port,
+            strictPort: options.strictPort,
+            host: options.host,
+            https: options.https,
+            open: options.open
+          }
+        })
+        server.printUrls()
       } catch (e) {
         createLogger(options.logLevel).error(
-          chalk.red(`error when starting preview server:\n${e.stack}`),
+          colors.red(`error when starting preview server:\n${e.stack}`),
           { error: e }
         )
         process.exit(1)
@@ -234,6 +264,6 @@ cli
   )
 
 cli.help()
-cli.version(require('../../package.json').version)
+cli.version(VERSION)
 
 cli.parse()

@@ -1,7 +1,8 @@
-/* eslint-disable node/no-extraneous-import */
-import { commandSync, ExecaSyncReturnValue, SyncOptions } from 'execa'
-import { mkdirpSync, readdirSync, remove, writeFileSync } from 'fs-extra'
 import { join } from 'path'
+import type { ExecaSyncReturnValue, SyncOptions } from 'execa'
+import { commandSync } from 'execa'
+import { mkdirpSync, readdirSync, remove, writeFileSync } from 'fs-extra'
+import { afterEach, beforeAll, expect, test } from 'vitest'
 
 const CLI_PATH = join(__dirname, '..')
 

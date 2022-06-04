@@ -1,4 +1,3 @@
-/// <reference lib="dom" />
 /// <reference path="./types/importMeta.d.ts" />
 
 // CSS modules
@@ -153,8 +152,10 @@ declare module '*.otf' {
 }
 
 // other
-declare module '*.wasm' {
-  const initWasm: (options: WebAssembly.Imports) => Promise<WebAssembly.Exports>
+declare module '*.wasm?init' {
+  const initWasm: (
+    options: WebAssembly.Imports
+  ) => Promise<WebAssembly.Instance>
   export default initWasm
 }
 declare module '*.webmanifest' {
@@ -162,6 +163,10 @@ declare module '*.webmanifest' {
   export default src
 }
 declare module '*.pdf' {
+  const src: string
+  export default src
+}
+declare module '*.txt' {
   const src: string
   export default src
 }

@@ -1,4 +1,9 @@
-import path from 'path'
+import path, { resolve } from 'path'
+import { fileURLToPath } from 'url'
+// @ts-expect-error
+import { version } from '../../package.json'
+
+export const VERSION = version as string
 
 export const DEFAULT_MAIN_FIELDS = [
   'module',
@@ -32,18 +37,27 @@ export const FS_PREFIX = `/@fs/`
 export const VALID_ID_PREFIX = `/@id/`
 
 /**
- * Some Rollup plugins use ids that starts with the null byte \0 to avoid
- * collisions, but it is not permitted in import URLs so we have to replace
- * them.
+ * Plugins that use 'virtual modules' (e.g. for helper functions), prefix the
+ * module ID with `\0`, a convention from the rollup ecosystem.
+ * This prevents other plugins from trying to process the id (like node resolution),
+ * and core features like sourcemaps can use this info to differentiate between
+ * virtual modules and regular files.
+ * `\0` is not a permitted char in import URLs so we have to replace them during
+ * import analysis. The id will be decoded back before entering the plugins pipeline.
+ * These encoded virtual ids are also prefixed by the VALID_ID_PREFIX, so virtual
+ * modules in the browser end up encoded as `/@id/__x00__{id}`
  */
 export const NULL_BYTE_PLACEHOLDER = `__x00__`
 
 export const CLIENT_PUBLIC_PATH = `/@vite/client`
 export const ENV_PUBLIC_PATH = `/@vite/env`
-// eslint-disable-next-line node/no-missing-require
-export const CLIENT_ENTRY = require.resolve('vite/dist/client/client.mjs')
-// eslint-disable-next-line node/no-missing-require
-export const ENV_ENTRY = require.resolve('vite/dist/client/env.mjs')
+export const VITE_PACKAGE_DIR = resolve(
+  fileURLToPath(import.meta.url),
+  '../../..'
+)
+
+export const CLIENT_ENTRY = resolve(VITE_PACKAGE_DIR, 'dist/client/client.mjs')
+export const ENV_ENTRY = resolve(VITE_PACKAGE_DIR, 'dist/client/env.mjs')
 export const CLIENT_DIR = path.dirname(CLIENT_ENTRY)
 
 // ** READ THIS ** before editing `KNOWN_ASSET_TYPES`.
@@ -75,9 +89,9 @@ export const KNOWN_ASSET_TYPES = [
   'otf',
 
   // other
-  'wasm',
   'webmanifest',
-  'pdf'
+  'pdf',
+  'txt'
 ]
 
 export const DEFAULT_ASSETS_RE = new RegExp(
